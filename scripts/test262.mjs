@@ -1,3 +1,4 @@
+import { nativeHostIncludes } from './native-host-includes.mjs'
 /**
  * Upstream Test262 against THIS compiler, with the legacy sweep's denominator.
  *
@@ -579,14 +580,6 @@ console.log(__gea_verdict)
 // Worker: compile, build, run one case at a time.
 // ---------------------------------------------------------------------------
 
-const engineRoots = [
-  'core/packages/core/include',
-  'core/packages/host/include',
-  'core/packages/engine',
-  'core/packages/engine/ui',
-  'core/packages/elements',
-  'core/packages/elements/ui'
-]
 const runtimeDir = join(here, 'src', 'targets', 'cpp', 'runtime')
 const runtimeHeaders = ['gea_runtime.h', 'gea_dynamic_proxy.h', 'gea_eval.h', 'gea_native_class_prototype.h']
 
@@ -627,7 +620,7 @@ const runWorker = async () => {
   const workerId = Number(flag('--worker', 0))
   const { compile } = await import(`${here}/dist/compiler.js`)
   const includeDir = join(measurementsDir, 'include')
-  const includes = [`-I${includeDir}`, ...engineRoots.map((root) => `-I${join(here, '..', root)}`)]
+  const includes = [`-I${includeDir}`, ...nativeHostIncludes]
   const pch = join(includeDir, 'gea_runtime.h.pch')
   const pchArguments = existsSync(pch) ? ['-include-pch', pch] : []
   const workDir = join(measurementsDir, 'work', `w${workerId}`)

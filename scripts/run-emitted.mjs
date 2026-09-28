@@ -1,3 +1,4 @@
+import { nativeHostIncludes } from './native-host-includes.mjs'
 /**
  * Compile a TypeScript program with geatsc, LINK it, and RUN it.
  *
@@ -126,18 +127,7 @@ const shapeProblems = [
 ]
 for (const problem of shapeProblems) console.error(`EMITTED SHAPE: ${problem}`)
 
-// The same include roots `corpus.mjs` uses, read from the tree rather than
-// copied, so a header that moves breaks this loudly.
-const here = resolve(import.meta.dirname, '..')
-const engineRoots = [
-  'core/packages/core/include',
-  'core/packages/host/include',
-  'core/packages/engine',
-  'core/packages/engine/ui',
-  'core/packages/elements',
-  'core/packages/elements/ui'
-]
-const includes = [`-I${out}`, ...engineRoots.map((root) => `-I${join(here, '..', root)}`)]
+const includes = [`-I${out}`, ...nativeHostIncludes]
 // A forced runtime include is safe only when the unit reaches it through a
 // prefix of standard-library includes. Host programs declare native types and
 // macros BEFORE the runtime; hoisting it across that prelude changes its ABI.

@@ -1,0 +1,7 @@
+{
+  "name": "source-subpath",
+  "type": "module",
+  "exports": {
+    "./v3": "./dist/v3/index.js"
+  }
+}

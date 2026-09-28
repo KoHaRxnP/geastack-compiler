@@ -1,3 +1,4 @@
+import { nativeHostIncludes } from './native-host-includes.mjs'
 import { readdirSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, copyFileSync, rmSync } from 'node:fs'
 import { join, resolve, relative, basename, dirname } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -486,15 +487,8 @@ const rows = selected.map(measureOne)
  * that compiled only because it declared its own `extern` for every host
  * global and would never have linked.
  */
-const engineRoots = [
-  'core/packages/core/include',
-  'core/packages/host/include',
-  'core/packages/engine',
-  'core/packages/engine/ui',
-  'core/packages/elements',
-  'core/packages/elements/ui'
-]
-const engineIncludes = engineRoots.map((root) => `-I${join(here, '..', root)}`)
+
+const engineIncludes = nativeHostIncludes
 
 /**
  * The iOS simulator sysroot and target triple, or an empty list when this

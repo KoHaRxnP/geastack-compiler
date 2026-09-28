@@ -1,0 +1,8 @@
+{
+  "name": "source-esm",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

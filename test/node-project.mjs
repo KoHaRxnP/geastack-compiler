@@ -1,9 +1,9 @@
 import test from 'node:test'
-import { nodeCompatRoot } from './corpus-roots.mjs'
 import assert from 'node:assert/strict'
 import ts from 'typescript'
 import { resolve, dirname, join } from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, realpathSync, lstatSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { discoverNodeProject, startEntry } from '../dist/semantics/node-project.js'
 import { createModuleResolver } from '../dist/semantics/module-resolution.js'
@@ -232,106 +232,135 @@ test('npm provenance supplies an exact source commit when modern publications om
   assert.equal(provenanceSourceIdentity(metadata, response(payload('git+https://github.com/attacker/server'))), undefined)
   assert.equal(provenanceSourceIdentity(metadata, response(payload(undefined, '0'.repeat(128)))), undefined)
 })
-// Hono and MongoDB were checked here against `node-compat/vendored-sources`,
-// which is gone: a checkout pinned to one version answered for whatever
-// version an application had installed, and kept answering after the
-// dependency moved. Their source now arrives the same way every other
-// package's does -- acquired for the exact installed version into
-// `node_modules/.cache/geatsc/sources` -- so there is no checked-in tree to
-// point a resolver at. The cases below keep the same assertion over the
-// corpus checkouts, which are real trees this repository does own.
-for (const [name, directory, specifier, suffix] of [
-  ['zod', '../corpus/cases/zod/src/packages/zod', 'zod/v3', '/src/v3/index.ts'],
-  ['neverthrow', '../corpus/cases/neverthrow/src', 'neverthrow', '/src/index.ts'],
-  ['tiny-invariant', '../corpus/cases/tiny-invariant/src', 'tiny-invariant', '/src/tiny-invariant.ts']
-])
-  test(`real ${name} source checkout resolves through metadata alone`, () => {
-    const packageRoot = resolve(compiler, directory)
-    assert.ok(existsSync(join(packageRoot, 'package.json')))
+// Real files pin source resolution and execution without an external corpus.
+const sourceFixtures = [
+  ['esm', 'source-esm', '/src/index.ts'],
+  ['commonjs', 'source-commonjs', '/src/index.cts'],
+  ['subpath', 'source-subpath/v3', '/src/v3/index.ts']
+]
+for (const [directory, specifier, suffix] of sourceFixtures)
+  test(`${specifier} source package resolves through metadata alone`, () => {
+    const packageRoot = realpathSync(resolve(compiler, 'test/fixtures/node-source-packages', directory))
     const result = createModuleResolver(ts.sys, options, new Set(), [{ root: packageRoot }]).resolve(
       specifier,
       resolve(root, 'main.ts'),
       ts.ModuleKind.ESNext
     )
-    assert.equal(result.implementation?.resolvedFileName, `${packageRoot}${suffix}`)
+    assert.equal(realpathSync(result.implementation.resolvedFileName), `${packageRoot}${suffix}`)
   })
-// Compiles against the node-compat runtime, which is a separate checkout.
-test(
-  'bare geatsc discovers, compiles, links, and runs a Node project',
-  { skip: nodeCompatRoot() ? false : 'set GEA_NODE_COMPAT_ROOT to a checkout of geastack/node-compat' },
-  () => {
-    const project = resolve(compiler, 'test/fixtures/node-project')
-    const defaultBuild = spawnSync(resolve(compiler, 'dist/cli.js'), [], {
-      cwd: project,
-      encoding: 'utf8',
-      timeout: 120000,
-      maxBuffer: 64 * 1024 * 1024
+// Install the actual packed compiler: node-compat must resolve this build through
+// normal npm peer resolution, never a linked checkout or an older registry compiler.
+test('bare geatsc discovers, compiles, links, and runs a Node project', () => {
+  const project = resolve(compiler, 'test/fixtures/node-project')
+  const packageOutput = join(project, 'dist')
+  mkdirSync(packageOutput, { recursive: true })
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+  const packed = JSON.parse(
+    execFileSync(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', packageOutput], {
+      cwd: compiler,
+      encoding: 'utf8'
     })
-    assert.equal(defaultBuild.status, 0, defaultBuild.stderr)
-    assert.doesNotMatch(defaultBuild.stderr, /\[build\] .* -std=c\+\+20 /)
-    const out = join(project, 'dist/.geatsc/automatic-node-project')
-    const executable = join(project, 'dist/automatic-node-project')
-    const report = JSON.parse(readFileSync(join(out, 'report.json'), 'utf8'))
-    const generatedProject = JSON.parse(readFileSync(join(out, 'tsconfig.json'), 'utf8'))
-    assert.equal(report.linked, true)
-    assert.ok(report.certificate)
-    assert.equal(report.layout, 'single')
-    assert.deepEqual(report.generatedFiles, ['automatic-node-project.cpp'])
-    assert.ok(existsSync(join(out, 'automatic-node-project.cpp')))
-    for (const legacy of ['server.cpp', 'main.cpp', 'gea_runtime.h', 'gea_dynamic_proxy.h', 'gea_eval.h']) {
-      assert.equal(existsSync(join(out, legacy)), false, `${legacy} should not be copied or generated`)
+  )
+  execFileSync(
+    npm,
+    [
+      'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--no-save',
+      '--package-lock=false',
+      join(packageOutput, packed[0].filename)
+    ],
+    {
+      cwd: project,
+      stdio: 'pipe'
     }
-    const singleSource = readFileSync(join(out, 'automatic-node-project.cpp'), 'utf8')
-    assert.match(singleSource, /run_compiled_program\(argc, argv, __gea_top_level\)/)
-    assert.deepEqual(Object.keys(generatedProject.compilerOptions.paths), ['@app/*', 'node:process'])
-    if (process.platform === 'darwin') assert.equal(existsSync(`${executable}.dSYM`), false)
-    assert.equal(execFileSync(executable, { encoding: 'utf8' }).trim(), '42')
-
-    const verboseBuild = spawnSync(resolve(compiler, 'dist/cli.js'), ['--verbose'], {
-      cwd: project,
-      encoding: 'utf8',
-      timeout: 120000,
-      maxBuffer: 64 * 1024 * 1024
-    })
-    assert.equal(verboseBuild.status, 0, verboseBuild.stderr)
-    assert.match(verboseBuild.stderr, /\[build\] .* -std=c\+\+20 /)
-
-    const perFileBuild = spawnSync(resolve(compiler, 'dist/cli.js'), ['--translation-units', 'per-file'], {
-      cwd: project,
-      encoding: 'utf8',
-      timeout: 120000,
-      maxBuffer: 64 * 1024 * 1024
-    })
-    assert.equal(perFileBuild.status, 0, perFileBuild.stderr)
-    const perFileReport = JSON.parse(readFileSync(join(out, 'report.json'), 'utf8'))
-    assert.equal(perFileReport.layout, 'per-file')
-    assert.deepEqual(
-      perFileReport.units
-        .filter((unit) => unit.role === 'module')
-        .map((unit) => unit.sourceFile)
-        .sort(),
-      // Exactly the application's two modules and the one builtin it imports.
-      // node-compat roots `whatwg-streams.ts` and `abort-events.ts` in every
-      // program; a unit for either here means an unused class hierarchy
-      // survived pruning (`reachability.ts`, `heritageIsInert`).
-      [join(project, 'src/index.ts'), join(project, 'src/value.ts'), resolve(nodeCompatRoot(), 'runtime/node/process.ts')].sort()
-    )
-    assert.ok(perFileReport.units.some((unit) => unit.role === 'program' && unit.fileName === 'automatic-node-project.cpp'))
-    assert.equal(execFileSync(executable, { encoding: 'utf8' }).trim(), '42')
-
-    const singleEmit = spawnSync(resolve(compiler, 'dist/cli.js'), ['--emit-only'], {
-      cwd: project,
-      encoding: 'utf8',
-      timeout: 120000,
-      maxBuffer: 64 * 1024 * 1024
-    })
-    assert.equal(singleEmit.status, 0, singleEmit.stderr)
-    assert.deepEqual(JSON.parse(readFileSync(join(out, 'report.json'), 'utf8')).generatedFiles, ['automatic-node-project.cpp'])
-    for (const unit of perFileReport.units.filter((unit) => unit.fileName !== 'automatic-node-project.cpp')) {
-      assert.equal(existsSync(join(out, unit.fileName)), false, `${unit.fileName} should be removed when changing layouts`)
-    }
+  )
+  const packageRequire = createRequire(join(project, 'package.json'))
+  const installedCompiler = dirname(packageRequire.resolve('@geastack/compiler/package.json'))
+  const installedRequire = createRequire(join(installedCompiler, 'package.json'))
+  const nodeCompat = dirname(installedRequire.resolve('@geastack/node-compat/package.json'))
+  assert.equal(installedCompiler, join(project, 'node_modules/@geastack/compiler'))
+  assert.equal(lstatSync(installedCompiler).isSymbolicLink(), false)
+  const driverRequire = createRequire(installedRequire.resolve('@geastack/node-compat/build'))
+  assert.equal(driverRequire.resolve('@geastack/compiler/package.json'), join(installedCompiler, 'package.json'))
+  assert.equal(readFileSync(join(installedCompiler, 'dist/compiler.js'), 'utf8'), readFileSync(join(compiler, 'dist/compiler.js'), 'utf8'))
+  assert.equal(
+    readFileSync(join(installedCompiler, 'src/targets/cpp/runtime/gea_runtime.h'), 'utf8'),
+    readFileSync(join(compiler, 'src/targets/cpp/runtime/gea_runtime.h'), 'utf8')
+  )
+  const cli = join(installedCompiler, 'dist/cli.js')
+  const defaultBuild = spawnSync(cli, [], {
+    cwd: project,
+    encoding: 'utf8',
+    timeout: 120000,
+    maxBuffer: 64 * 1024 * 1024
+  })
+  assert.equal(defaultBuild.status, 0, defaultBuild.stderr)
+  assert.doesNotMatch(defaultBuild.stderr, /\[build\] .* -std=c\+\+20 /)
+  const out = join(project, 'dist/.geatsc/automatic-node-project')
+  const executable = join(project, 'dist/automatic-node-project')
+  const report = JSON.parse(readFileSync(join(out, 'report.json'), 'utf8'))
+  const generatedProject = JSON.parse(readFileSync(join(out, 'tsconfig.json'), 'utf8'))
+  assert.equal(report.linked, true)
+  assert.ok(report.certificate)
+  assert.equal(report.layout, 'single')
+  assert.deepEqual(report.generatedFiles, ['automatic-node-project.cpp'])
+  assert.ok(existsSync(join(out, 'automatic-node-project.cpp')))
+  for (const legacy of ['server.cpp', 'main.cpp', 'gea_runtime.h', 'gea_dynamic_proxy.h', 'gea_eval.h']) {
+    assert.equal(existsSync(join(out, legacy)), false, `${legacy} should not be copied or generated`)
   }
-)
+  const singleSource = readFileSync(join(out, 'automatic-node-project.cpp'), 'utf8')
+  assert.match(singleSource, /run_compiled_program\(argc, argv, __gea_top_level\)/)
+  assert.deepEqual(Object.keys(generatedProject.compilerOptions.paths), ['@app/*', 'node:process'])
+  if (process.platform === 'darwin') assert.equal(existsSync(`${executable}.dSYM`), false)
+  assert.equal(execFileSync(executable, { encoding: 'utf8' }).trim(), '42')
+
+  const verboseBuild = spawnSync(cli, ['--verbose'], {
+    cwd: project,
+    encoding: 'utf8',
+    timeout: 120000,
+    maxBuffer: 64 * 1024 * 1024
+  })
+  assert.equal(verboseBuild.status, 0, verboseBuild.stderr)
+  assert.match(verboseBuild.stderr, /\[build\] .* -std=c\+\+20 /)
+
+  const perFileBuild = spawnSync(cli, ['--translation-units', 'per-file'], {
+    cwd: project,
+    encoding: 'utf8',
+    timeout: 120000,
+    maxBuffer: 64 * 1024 * 1024
+  })
+  assert.equal(perFileBuild.status, 0, perFileBuild.stderr)
+  const perFileReport = JSON.parse(readFileSync(join(out, 'report.json'), 'utf8'))
+  assert.equal(perFileReport.layout, 'per-file')
+  assert.deepEqual(
+    perFileReport.units
+      .filter((unit) => unit.role === 'module')
+      .map((unit) => unit.sourceFile)
+      .sort(),
+    // Exactly the application's two modules and the one builtin it imports.
+    // node-compat roots `whatwg-streams.ts` and `abort-events.ts` in every
+    // program; a unit for either here means an unused class hierarchy
+    // survived pruning (`reachability.ts`, `heritageIsInert`).
+    [join(project, 'src/index.ts'), join(project, 'src/value.ts'), resolve(nodeCompat, 'runtime/node/process.ts')].sort()
+  )
+  assert.ok(perFileReport.units.some((unit) => unit.role === 'program' && unit.fileName === 'automatic-node-project.cpp'))
+  assert.equal(execFileSync(executable, { encoding: 'utf8' }).trim(), '42')
+
+  const singleEmit = spawnSync(cli, ['--emit-only'], {
+    cwd: project,
+    encoding: 'utf8',
+    timeout: 120000,
+    maxBuffer: 64 * 1024 * 1024
+  })
+  assert.equal(singleEmit.status, 0, singleEmit.stderr)
+  assert.deepEqual(JSON.parse(readFileSync(join(out, 'report.json'), 'utf8')).generatedFiles, ['automatic-node-project.cpp'])
+  for (const unit of perFileReport.units.filter((unit) => unit.fileName !== 'automatic-node-project.cpp')) {
+    assert.equal(existsSync(join(out, unit.fileName)), false, `${unit.fileName} should be removed when changing layouts`)
+  }
+})
 
 const preparationFixture = () => {
   const data = new Map([
@@ -490,28 +519,33 @@ test('every installed copy of one published version shares one checkout', async 
   assert.equal(new Set(result.map((source) => source.root)).size, 1)
 })
 
-test('the Node oracle executes the same unbuilt checkout through the shared resolver', () => {
-  const packageRoot = resolve(compiler, '../corpus/cases/tiny-invariant/src')
-  const output = execFileSync(
-    process.execPath,
-    [
-      '--import',
-      resolve(compiler, '../corpus/node_modules/tsx/dist/loader.mjs'),
-      '--import',
-      resolve(compiler, 'dist/semantics/node-source-hooks.js'),
-      '--input-type=module',
-      '--eval',
-      "import invariant from 'tiny-invariant'; invariant(true); console.log('oracle-ok')"
-    ],
-    {
-      cwd: compiler,
-      encoding: 'utf8',
-      timeout: 30000,
-      env: { ...process.env, GEATSC_SOURCE_CONTEXT: JSON.stringify({ root: compiler, packageSources: [{ root: packageRoot }] }) }
-    }
-  )
-  assert.equal(output.trim(), 'oracle-ok')
-})
+for (const [directory, specifier, expression, expected] of [
+  ['esm', 'source-esm', 'value(true)', 'oracle-ok'],
+  ['commonjs', 'source-commonjs', 'value', 'commonjs-ok'],
+  ['subpath', 'source-subpath/v3', 'value.value', 'subpath-ok']
+])
+  test(`Node executes unbuilt ${specifier} through the shared resolver`, () => {
+    const packageRoot = resolve(compiler, 'test/fixtures/node-source-packages', directory)
+    const output = execFileSync(
+      process.execPath,
+      [
+        // This hook already transpiles the selected source. Loading tsx as a second
+        // async hook breaks Node's synchronous load-hook source contract.
+        '--import',
+        resolve(compiler, 'dist/semantics/node-source-hooks.js'),
+        '--input-type=module',
+        '--eval',
+        `${directory === 'subpath' ? 'import * as value' : 'import value'} from '${specifier}'; console.log(${expression})`
+      ],
+      {
+        cwd: compiler,
+        encoding: 'utf8',
+        timeout: 30000,
+        env: { ...process.env, GEATSC_SOURCE_CONTEXT: JSON.stringify({ root: compiler, packageSources: [{ root: packageRoot }] }) }
+      }
+    )
+    assert.equal(output.trim(), expected)
+  })
 
 test('dependency installation follows the selected manager and its lock without lifecycle scripts', async () => {
   const { dependencyInstallCommand } = await import('../dist/project-preparation.js')

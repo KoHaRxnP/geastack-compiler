@@ -6,6 +6,7 @@ on:
     paths:
       - src/**
       - scripts/**
+      - test/**
       - package.json
       - package-lock.json
       - tsconfig.json
@@ -28,6 +29,18 @@ permissions:
 # cannot call a reusable workflow that lives in a private one, so the job and
 # the shell it runs now live here, under scripts/ci/.
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+
   hono-hello:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -44,20 +57,6 @@ jobs:
 
       # GEA_CI_TOKEN is only needed while these repositories are private; once
       # they are readable without it the default job token is enough.
-      - name: Check out geastack/apple, which the compiler depends on by local path
-        uses: actions/checkout@v7
-        with:
-          repository: geastack/apple
-          token: ${{ secrets.GEA_CI_TOKEN || github.token }}
-          path: apple
-
-      - name: Check out geastack/core, which the compiler depends on by local path
-        uses: actions/checkout@v7
-        with:
-          repository: geastack/core
-          token: ${{ secrets.GEA_CI_TOKEN || github.token }}
-          path: core
-
       - name: Check out node-compat, which holds the app and the runtime
         uses: actions/checkout@v7
         with:
@@ -77,10 +76,10 @@ jobs:
       - name: Report the toolchain
         run: compiler/scripts/ci/shared/report-toolchain.sh
 
-      - name: Build the compiler (npm install until its lockfile is synced with the local-path dependencies)
+      - name: Build the compiler from the locked npm dependencies
         run: compiler/scripts/ci/shared/npm-build.sh compiler
 
-      - name: Install node-compat's dependencies and the unmodified hono package; link the compiler under test
+      - name: Install node-compat's dependencies and the unmodified hono package; install the packed compiler under test
         run: compiler/scripts/ci/node-compat/hono-hello/install.sh
 
       - name: Transpile hono-hello to C++ and link it with clang++

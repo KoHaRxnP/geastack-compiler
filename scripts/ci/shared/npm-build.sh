@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Build a checked-out npm project. Usage: npm-build.sh <dir>
 #
-# `npm install`, not `npm ci`: the compiler's lockfile predates its `file:`
-# dependencies on apple and core, so `ci` refuses it. Commit a synced lock and
-# this becomes `ci`.
+# Use the same locked npm dependency graph as a fresh clone.
 set -euo pipefail
 
 cd "$1"
-npm install --ignore-scripts
+npm ci --ignore-scripts
 npm run build
