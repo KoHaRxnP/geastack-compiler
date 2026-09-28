@@ -1433,6 +1433,13 @@ inline constexpr std::uint32_t cycleMature = std::uint32_t{1} << 29;
 // full collection -- the only pass that could ever free it -- examines it.
 inline constexpr std::uint32_t cyclePermanent = std::uint32_t{1} << 28;
 inline void dropNativeExpando(const void* object, RefCounts* counts);
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+// Only creating an expando should retain its registry's erase machinery.
+inline void (*nativeExpandoDropper)(const void*, RefCounts*) = nullptr;
+inline void dropTaggedExpando(const void* object, RefCounts* counts) { nativeExpandoDropper(object, counts); }
+#else
+inline void dropTaggedExpando(const void* object, RefCounts* counts) { dropNativeExpando(object, counts); }
+#endif
 template <typename T>
 inline RefCounts* refCountsOf(T* object);
 
@@ -1992,7 +1999,7 @@ struct RefOperationsFor {
     profileRefDestroyed<T>(refBlockSize<T>, cycleState().collecting, object);
 #endif
     RefCounts* counts = refCountsOf(static_cast<T*>(object));
-    if ((counts->weak & expandoTagged) != 0) [[unlikely]] dropNativeExpando(object, counts);
+    if ((counts->weak & expandoTagged) != 0) [[unlikely]] dropTaggedExpando(object, counts);
     // Unlike `expandoTagged`, `cycleMature` has no side table to notify -- an
     // unconditional clear is as cheap as the branch would be. Without this,
     // an object that died mature (as most steady-state objects do) would
@@ -2004,7 +2011,8 @@ struct RefOperationsFor {
   }
   static void release(void* block) { AllocationPool<refBlockSize<T>, refBlockAlign<T>>::give(block); }
   static void trace(const void* object, RefVisitor& visitor) { traceRefs(*static_cast<const T*>(object), visitor); }
-  static const RefOperations* classBase() {
+  // Constant initialization lets the linker discard unused type operations.
+  static constexpr const RefOperations* classBase() {
     using Base = typename ClassRefBase<T>::type;
     if constexpr (std::is_void_v<Base>) return nullptr;
     else return &RefOperationsFor<Base>::table;
@@ -2271,8 +2279,20 @@ struct Ref {
    * the branch is a property of the type, so the non-final path is not even
    * emitted for a final one.
    */
-  [[gnu::always_inline]] void release() {
+#if !defined(GEA_RUNTIME_COMPACT_CODE) || !GEA_RUNTIME_COMPACT_CODE
+  [[gnu::always_inline]]
+#endif
+  void release() {
     if (pointer_ == nullptr) return;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+    releaseOutOfLine(pointer_);
+#else
+    releasePointer(pointer_);
+#endif
+  }
+  // Keep handles in registers while sharing their release body on small targets.
+  [[gnu::noinline]] static void releaseOutOfLine(T* pointer) { releasePointer(pointer); }
+  [[gnu::always_inline]] static void releasePointer(T* pointer_) {
     detail::RefCounts* counts = detail::refCountsOf(pointer_);
     // A cycle collection marks its whole unreachable subgraph dead before
     // destroying any node. These are its internal edges, not another owner.
@@ -2304,12 +2324,18 @@ struct Ref {
   // `CallableObject` built inline for a closure-table store carried two empty
   // handles whose null-ness clang had just written and then had to re-test,
   // because this call had taken their address on the previous iteration.
-  [[gnu::noinline]] static void releaseLast(T* pointer, detail::RefCounts* counts) {
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  // releaseOutOfLine already shares the complete body in compact builds.
+  [[gnu::always_inline]]
+#else
+  [[gnu::noinline]]
+#endif
+  static void releaseLast(T* pointer, detail::RefCounts* counts) {
     if constexpr (std::is_final_v<T>) {
 #if defined(GEA_PROFILE_ALLOCATIONS)
       detail::profileRefDestroyed<T>(detail::refBlockSize<T>, detail::cycleState().collecting, pointer);
 #endif
-      if ((counts->weak & detail::expandoTagged) != 0) [[unlikely]] detail::dropNativeExpando(pointer, counts);
+      if ((counts->weak & detail::expandoTagged) != 0) [[unlikely]] detail::dropTaggedExpando(pointer, counts);
       // See `RefOperationsFor::destroy`: an object that died `cycleMature`
       // must not carry the bit into the `weak == 0` check just below.
       counts->weak &= ~(detail::cycleMature | detail::cyclePermanent);
@@ -3869,6 +3895,25 @@ struct CallableObject<Result(Arguments...)> {
     auto copy = *this;
     return [copy](Extra...) -> Result { return copy.call(); };
   }
+};
+
+// Header-only builtins must not register dynamic initializers: taking every
+// thunk's address at startup keeps all of libm in even a math-free program.
+// Materialize the shared callable only on a value read, preserving its identity.
+template <typename Signature, auto Entry>
+struct HostFunction;
+
+template <typename Result, typename... Arguments, Result (*Entry)(void*, Arguments...)>
+struct HostFunction<Result(Arguments...), Entry> {
+  using Carrier = CallableObject<Result(Arguments...)>;
+  static const Carrier& carrier() {
+    static const Carrier value{Entry, nullptr};
+    return value;
+  }
+  operator const Carrier&() const { return carrier(); }
+  const Carrier& identified() const { return carrier().identified(); }
+  [[gnu::always_inline]] Result call(Arguments... arguments) const { return Entry(nullptr, std::forward<Arguments>(arguments)...); }
+  [[gnu::always_inline]] Result operator()(Arguments... arguments) const { return Entry(nullptr, std::forward<Arguments>(arguments)...); }
 };
 
 namespace detail {
@@ -13862,6 +13907,9 @@ inline gea::Ref<DynamicObject> expandoFor(const gea::Ref<void>& payload, bool cr
   fresh.table->markNativeExpando();
   entries[address] = fresh;
   refCountsOf(payload.get())->weak |= expandoTagged;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  nativeExpandoDropper = &dropNativeExpando;
+#endif
   return fresh.table;
 }
 
@@ -22214,47 +22262,47 @@ inline double imul_invoke(void*, double a, double b) {
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> floor;
 #else
-inline const gea::CallableObject<double(double)> floor{detail::floor_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::floor_invoke> floor{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> round;
 #else
-inline const gea::CallableObject<double(double)> round{detail::round_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::round_invoke> round{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> sin;
 #else
-inline const gea::CallableObject<double(double)> sin{detail::sin_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::sin_invoke> sin{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> cos;
 #else
-inline const gea::CallableObject<double(double)> cos{detail::cos_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::cos_invoke> cos{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> sqrt;
 #else
-inline const gea::CallableObject<double(double)> sqrt{detail::sqrt_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::sqrt_invoke> sqrt{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> abs;
 #else
-inline const gea::CallableObject<double(double)> abs{detail::abs_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::abs_invoke> abs{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> ceil;
 #else
-inline const gea::CallableObject<double(double)> ceil{detail::ceil_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::ceil_invoke> ceil{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double, double)> pow;
 #else
-inline const gea::CallableObject<double(double, double)> pow{detail::pow_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double, double), &detail::pow_invoke> pow{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double, double)> atan2;
 #else
-inline const gea::CallableObject<double(double, double)> atan2{detail::atan2_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double, double), &detail::atan2_invoke> atan2{};
 #endif
 // The rest of the transcendentals the corpus reaches. Each is ECMA-262's own
 // definition and each is `<cmath>`'s function of the same name -- 21.3.2.2
@@ -22263,47 +22311,47 @@ inline const gea::CallableObject<double(double, double)> atan2{detail::atan2_inv
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> tan;
 #else
-inline const gea::CallableObject<double(double)> tan{detail::tan_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::tan_invoke> tan{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> asin;
 #else
-inline const gea::CallableObject<double(double)> asin{detail::asin_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::asin_invoke> asin{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> acos;
 #else
-inline const gea::CallableObject<double(double)> acos{detail::acos_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::acos_invoke> acos{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> atan;
 #else
-inline const gea::CallableObject<double(double)> atan{detail::atan_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::atan_invoke> atan{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> sinh;
 #else
-inline const gea::CallableObject<double(double)> sinh{detail::sinh_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::sinh_invoke> sinh{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> log;
 #else
-inline const gea::CallableObject<double(double)> log{detail::log_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::log_invoke> log{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double()> random;
 #else
-inline const gea::CallableObject<double()> random{detail::random_invoke, nullptr};
+inline constexpr gea::HostFunction<double(), &detail::random_invoke> random{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> max;
 #else
-inline const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> max{detail::max_invoke, nullptr};
+inline constexpr gea::HostFunction<double(gea::Ref<gea::ArrayObject<double>>), &detail::max_invoke> max{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> min;
 #else
-inline const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> min{detail::min_invoke, nullptr};
+inline constexpr gea::HostFunction<double(gea::Ref<gea::ArrayObject<double>>), &detail::min_invoke> min{};
 #endif
 // A direct call's already-evaluated numeric operands need no JS array identity.
 // The initializer list borrows native stack storage for this synchronous call.
@@ -22320,7 +22368,7 @@ inline double minDirect(std::initializer_list<double> values) {
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> hypot;
 #else
-inline const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> hypot{detail::hypot_invoke, nullptr};
+inline constexpr gea::HostFunction<double(gea::Ref<gea::ArrayObject<double>>), &detail::hypot_invoke> hypot{};
 #endif
 // The sixteen members `lib.es2015.core.d.ts` adds to `Math` beyond the ES5 set
 // plus `cbrt`, each over the same exact scalar ABI as the row above. `imul` is
@@ -22328,82 +22376,82 @@ inline const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> hyp
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> cbrt;
 #else
-inline const gea::CallableObject<double(double)> cbrt{detail::cbrt_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::cbrt_invoke> cbrt{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> sign;
 #else
-inline const gea::CallableObject<double(double)> sign{detail::sign_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::sign_invoke> sign{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> trunc;
 #else
-inline const gea::CallableObject<double(double)> trunc{detail::trunc_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::trunc_invoke> trunc{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> exp;
 #else
-inline const gea::CallableObject<double(double)> exp{detail::exp_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::exp_invoke> exp{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> expm1;
 #else
-inline const gea::CallableObject<double(double)> expm1{detail::expm1_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::expm1_invoke> expm1{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> log10;
 #else
-inline const gea::CallableObject<double(double)> log10{detail::log10_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::log10_invoke> log10{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> log1p;
 #else
-inline const gea::CallableObject<double(double)> log1p{detail::log1p_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::log1p_invoke> log1p{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> log2;
 #else
-inline const gea::CallableObject<double(double)> log2{detail::log2_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::log2_invoke> log2{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> cosh;
 #else
-inline const gea::CallableObject<double(double)> cosh{detail::cosh_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::cosh_invoke> cosh{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> tanh;
 #else
-inline const gea::CallableObject<double(double)> tanh{detail::tanh_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::tanh_invoke> tanh{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> acosh;
 #else
-inline const gea::CallableObject<double(double)> acosh{detail::acosh_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::acosh_invoke> acosh{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> asinh;
 #else
-inline const gea::CallableObject<double(double)> asinh{detail::asinh_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::asinh_invoke> asinh{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> atanh;
 #else
-inline const gea::CallableObject<double(double)> atanh{detail::atanh_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::atanh_invoke> atanh{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> fround;
 #else
-inline const gea::CallableObject<double(double)> fround{detail::fround_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::fround_invoke> fround{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double)> clz32;
 #else
-inline const gea::CallableObject<double(double)> clz32{detail::clz32_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double), &detail::clz32_invoke> clz32{};
 #endif
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double(double, double)> imul;
 #else
-inline const gea::CallableObject<double(double, double)> imul{detail::imul_invoke, nullptr};
+inline constexpr gea::HostFunction<double(double, double), &detail::imul_invoke> imul{};
 #endif
 
 /** `readonly PI: number` -- a data property, not a method; no `CallableObject`. */
@@ -22698,7 +22746,7 @@ inline double now_invoke(void*) {
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<double()> now;
 #else
-inline const gea::CallableObject<double()> now{detail::now_invoke, nullptr};
+inline constexpr gea::HostFunction<double(), &detail::now_invoke> now{};
 #endif
 
 }  // namespace DateConstructor
@@ -22722,7 +22770,7 @@ inline std::string fromCharCode_invoke(void*, gea::Ref<gea::ArrayObject<double>>
 #if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
 extern const gea::CallableObject<std::string(gea::Ref<gea::ArrayObject<double>>)> fromCharCode;
 #else
-inline const gea::CallableObject<std::string(gea::Ref<gea::ArrayObject<double>>)> fromCharCode{detail::fromCharCode_invoke, nullptr};
+inline constexpr gea::HostFunction<std::string(gea::Ref<gea::ArrayObject<double>>), &detail::fromCharCode_invoke> fromCharCode{};
 #endif
 
 }  // namespace StringConstructor
