@@ -62,7 +62,11 @@ export const geaCppPrelude = (options: PluginOptions): readonly string[] => {
   // has `<p>`s and `<h1>`s, and the cascade breaks equal-specificity ties by
   // source order, so anything the app states about the same tag has to be
   // registered after this to win.
-  const body = tape.length === 0 ? geaUserAgentStyleSheet : `${geaUserAgentStyleSheet}\n${tape}`
+  const styles = tape.length === 0 ? geaUserAgentStyleSheet : `${geaUserAgentStyleSheet}\n${tape}`
+  // The build's proven canvas-only mode does not link the CSS engine. Keep
+  // this decision on the same native definition as the frame loop; the
+  // compiler still emits identical typed canvas calls for both modes.
+  const body = `#if !defined(GEA_EMBEDDED_DIRECT_CANVAS_CONTEXT) || !GEA_EMBEDDED_DIRECT_CANVAS_CONTEXT\n${styles}\n#endif`
   const provenance = `// @geastack/compiler gea C++ prelude\n// prelude=${tapePath ?? '<none: user-agent defaults only>'}`
   if (named) return [`${provenance}\nvoid ${symbol}() {\n${indent(body, '  ')}\n}`]
   return [
